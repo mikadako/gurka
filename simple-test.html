@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Simple Test</title>
+</head>
+<body>
+    <h1>Simple Test</h1>
+    <button id="test-button">Test Button</button>
+    <div id="output"></div>
+    
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {
+            console.log('DOM loaded');
+            const button = document.getElementById('test-button');
+            const output = document.getElementById('output');
+            
+            if (button) {
+                button.addEventListener('click', () => {
+                    output.textContent = 'Button clicked at ' + new Date().toLocaleTimeString();
+                    console.log('Button clicked');
+                });
+                output.textContent = 'Script loaded, button ready';
+            } else {
+                output.textContent = 'Button not found!';
+            }
+        });
+    </script>
+</body>
+</html>

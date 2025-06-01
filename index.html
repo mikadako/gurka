@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gurka - Card Game</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="setup-screen" class="screen">
+        <h1>Välkommen till Gurka!</h1>
+        <div class="setup-container">
+            <label for="player-count">Antal spelare (2-8):</label>
+            <input type="number" id="player-count" min="2" max="8" value="4">
+            <button id="start-game">Starta spel</button>
+        </div>
+    </div>
+
+    <div id="game-screen" class="screen hidden">
+        <div class="game-info">
+            <h2>Gurka</h2>
+            <div id="current-player"></div>
+            <div id="game-status"></div>
+        </div>
+
+        <div id="play-area">
+            <div id="player-piles"></div>
+        </div>
+
+        <div id="player-area">
+            <h3>Dina kort</h3>
+            <div id="player-hand"></div>
+            <div id="player-info"></div>
+        </div>
+
+        <div id="scoreboard">
+            <h3>Poäng</h3>
+            <div id="scores"></div>
+        </div>
+
+        <div id="round-end-modal" class="modal hidden">
+            <div class="modal-content">
+                <div id="round-end-message"></div>
+                <button id="continue-button">Fortsätt</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
