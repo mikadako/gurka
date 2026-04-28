@@ -445,6 +445,133 @@ class Player {
     }
 }
 
+// Lightweight simulation engine used by the PIMC AI.
+// Mirrors the GurkaGame rules: when following, you must play your lowest card
+// or the smallest card higher than the current high card.
+class SimGame {
+    constructor(hands, currentPlayerIndex, trickCards, trickPlayers, highCard, highCardPlayerIndex, scores, eliminated) {
+        this.hands = hands.map(h => h.slice());
+        this.currentPlayerIndex = currentPlayerIndex;
+        this.trickCards = trickCards.slice();
+        this.trickPlayers = trickPlayers.slice();
+        this.highCard = highCard;
+        this.highCardPlayerIndex = highCardPlayerIndex;
+        this.scores = scores.slice();
+        this.eliminated = eliminated.slice();
+        this.numPlayers = hands.length;
+        this.roundEnded = false;
+    }
+
+    activePlayerCount() {
+        let count = 0;
+        for (let i = 0; i < this.numPlayers; i++) {
+            if (!this.eliminated[i]) count++;
+        }
+        return count;
+    }
+
+    getValidCards(playerIndex) {
+        const hand = this.hands[playerIndex];
+        if (hand.length === 0) return [];
+        const sorted = hand.slice().sort((a, b) => a.value - b.value);
+        if (!this.highCard) return sorted;
+        const lowest = sorted[0];
+        const result = [lowest];
+        const higher = sorted.find(c => c.value > this.highCard.value);
+        if (higher && higher !== lowest) result.push(higher);
+        return result;
+    }
+
+    playCard(playerIndex, card) {
+        const hand = this.hands[playerIndex];
+        const idx = hand.findIndex(c => c.suit === card.suit && c.rank === card.rank);
+        if (idx < 0) {
+            this.roundEnded = true;
+            return;
+        }
+        hand.splice(idx, 1);
+        this.trickCards.push(card);
+        this.trickPlayers.push(playerIndex);
+        if (!this.highCard || card.value > this.highCard.value) {
+            this.highCard = card;
+            this.highCardPlayerIndex = playerIndex;
+        }
+        if (this.trickCards.length === this.activePlayerCount()) {
+            this.endTrick();
+        } else {
+            do {
+                this.currentPlayerIndex = (this.currentPlayerIndex + 1) % this.numPlayers;
+            } while (this.eliminated[this.currentPlayerIndex]);
+        }
+    }
+
+    endTrick() {
+        let allEmpty = true;
+        for (let i = 0; i < this.numPlayers; i++) {
+            if (!this.eliminated[i] && this.hands[i].length > 0) {
+                allEmpty = false;
+                break;
+            }
+        }
+
+        if (allEmpty) {
+            // Score the final trick — only the highest card(s) score.
+            let maxValue = 0;
+            const winners = [];
+            for (let i = 0; i < this.trickCards.length; i++) {
+                const v = this.trickCards[i].value;
+                if (v > maxValue) {
+                    maxValue = v;
+                    winners.length = 0;
+                    winners.push(this.trickPlayers[i]);
+                } else if (v === maxValue) {
+                    winners.push(this.trickPlayers[i]);
+                }
+            }
+            for (const pi of winners) {
+                if (maxValue === 14) {
+                    this.eliminated[pi] = true;
+                } else {
+                    this.scores[pi] += maxValue;
+                    if (this.scores[pi] >= 50) this.eliminated[pi] = true;
+                }
+            }
+            this.roundEnded = true;
+        } else {
+            this.currentPlayerIndex = this.highCardPlayerIndex;
+            this.trickCards = [];
+            this.trickPlayers = [];
+            this.highCard = null;
+            this.highCardPlayerIndex = null;
+        }
+    }
+
+    // Rollout policy: leading dumps the highest card, following plays the
+    // lowest. This captures the core Gurka idea of saving low cards for the
+    // scoring final trick while shedding high ones early.
+    chooseRolloutCard(playerIndex) {
+        const valid = this.getValidCards(playerIndex);
+        if (valid.length === 1) return valid[0];
+        if (!this.highCard) {
+            const hand = this.hands[playerIndex];
+            let highest = hand[0];
+            for (const c of hand) {
+                if (c.value > highest.value) highest = c;
+            }
+            return highest;
+        }
+        return valid[0];
+    }
+
+    simulateToEnd() {
+        let safety = 200;
+        while (!this.roundEnded && safety-- > 0) {
+            const card = this.chooseRolloutCard(this.currentPlayerIndex);
+            this.playCard(this.currentPlayerIndex, card);
+        }
+    }
+}
+
 class GurkaGame {
     constructor() {
         this.players = [];
@@ -665,186 +792,165 @@ class GurkaGame {
         }
     }
 
+    // Decide a card using Perfect Information Monte Carlo (PIMC):
+    // 1. Sample many opponent hands consistent with what's been seen.
+    // 2. For each candidate card, play it then roll out the rest of the round
+    //    using a heuristic policy for every player.
+    // 3. Score the resulting end-of-round state with a utility tuned to the
+    //    current scoreboard (closeness to 50, opponent count) and pick the
+    //    card with the best average utility across determinizations.
     chooseStrategicCard(playerIndex, validCards) {
-        const player = this.players[playerIndex];
-        const cardsInHand = player.hand.length;
-        const tricksLeft = cardsInHand;
-        const activePlayers = this.getActivePlayers();
+        if (validCards.length === 1) return validCards[0];
 
-        // Special handling for last trick
-        if (tricksLeft === 1) {
-            // On last trick, play the only card we have
-            return validCards[0];
+        const numSims = this.calculateSimCount(playerIndex);
+        const stats = validCards.map(c => ({ card: c, total: 0, count: 0 }));
+
+        const scoresBefore = this.players.map(p => p.score);
+        const eliminatedBefore = this.players.map(p => p.eliminated);
+
+        for (let s = 0; s < numSims; s++) {
+            const determinizedHands = this.determinize(playerIndex);
+            if (!determinizedHands) continue;
+
+            for (const entry of stats) {
+                const sim = this.createSimGame(determinizedHands);
+                sim.playCard(playerIndex, entry.card);
+                sim.simulateToEnd();
+                entry.total += this.evaluateSimOutcome(sim, playerIndex, scoresBefore, eliminatedBefore);
+                entry.count++;
+            }
         }
 
-        // Calculate danger scores for each valid card
-        const cardScores = validCards.map(card => {
-            return {
-                card: card,
-                score: this.evaluateCard(playerIndex, card, tricksLeft)
-            };
-        });
-
-        // Sort by score (higher is better)
-        cardScores.sort((a, b) => b.score - a.score);
-
-        // Add some randomness to avoid being too predictable
-        const topChoices = cardScores.filter(cs => cs.score >= cardScores[0].score - 10);
-        const choice = topChoices[Math.floor(Math.random() * topChoices.length)];
-
-        return choice.card;
+        let best = stats[0];
+        let bestAvg = best.count > 0 ? best.total / best.count : -Infinity;
+        for (const entry of stats) {
+            if (entry.count === 0) continue;
+            const avg = entry.total / entry.count;
+            if (avg > bestAvg) {
+                bestAvg = avg;
+                best = entry;
+            }
+        }
+        return best.card;
     }
 
-    evaluateCard(playerIndex, card, tricksLeft) {
-        const player = this.players[playerIndex];
-        let score = 0;
+    calculateSimCount(playerIndex) {
+        const cardsInHand = this.players[playerIndex].hand.length;
+        const activeCount = this.getActivePlayers().length;
+        if (cardsInHand <= 1) return 1;
+        if (cardsInHand === 2) return 80;
+        if (cardsInHand === 3) return 140;
+        return Math.max(80, Math.min(220, Math.round(800 / activeCount)));
+    }
 
-        // Check if we have an ace
-        const hasAce = player.hand.some(c => c.value === 14);
+    determinize(myIndex) {
+        const knownKeys = new Set();
+        this.players[myIndex].hand.forEach(c => knownKeys.add(`${c.value}-${c.suit}`));
+        for (const pile of Object.values(this.playerPiles)) {
+            for (const c of pile) knownKeys.add(`${c.value}-${c.suit}`);
+        }
 
-        // Base scoring
-        if (!this.highCard) {
-            // Starting a trick
-            if (hasAce && tricksLeft > 2) {
-                // Try to get rid of ace early
-                if (card.value === 14) {
-                    score += 100;
-                } else if (card.value > 10) {
-                    // Play high cards early when we have ace
-                    score += 50;
-                }
-            } else {
-                // Normal play - prefer middle cards
-                if (card.value >= 6 && card.value <= 10) {
-                    score += 40;
+        const unknownCards = [];
+        const suits = ['hearts', 'diamonds', 'clubs', 'spades'];
+        for (const suit of suits) {
+            for (let rank = 1; rank <= 13; rank++) {
+                const value = rank === 1 ? 14 : rank;
+                if (!knownKeys.has(`${value}-${suit}`)) {
+                    unknownCards.push(new Card(suit, rank));
                 }
             }
+        }
+
+        for (let attempt = 0; attempt < 30; attempt++) {
+            for (let i = unknownCards.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [unknownCards[i], unknownCards[j]] = [unknownCards[j], unknownCards[i]];
+            }
+            const dealt = this.tryDealHands(myIndex, unknownCards, false);
+            if (dealt) return dealt;
+        }
+        return this.tryDealHands(myIndex, unknownCards, true);
+    }
+
+    tryDealHands(myIndex, unknownCards, ignoreConstraints) {
+        const hands = this.players.map((p, i) => (i === myIndex ? p.hand.slice() : []));
+        const remaining = unknownCards.slice();
+
+        const opponents = [];
+        for (let i = 0; i < this.players.length; i++) {
+            if (i === myIndex || this.players[i].eliminated) continue;
+            opponents.push({
+                idx: i,
+                handSize: this.players[i].hand.length,
+                lowerBound: ignoreConstraints ? 2 : (this.playerMinimumCard[i] || 2)
+            });
+        }
+        // Most-constrained opponent first to minimize dead-ends.
+        opponents.sort((a, b) => b.lowerBound - a.lowerBound);
+
+        for (const opp of opponents) {
+            const dealt = [];
+            for (let j = 0; j < remaining.length && dealt.length < opp.handSize; j++) {
+                if (remaining[j].value >= opp.lowerBound) {
+                    dealt.push(remaining[j]);
+                    remaining.splice(j, 1);
+                    j--;
+                }
+            }
+            if (dealt.length < opp.handSize) return null;
+            hands[opp.idx] = dealt;
+        }
+        return hands;
+    }
+
+    createSimGame(determinizedHands) {
+        return new SimGame(
+            determinizedHands,
+            this.currentPlayerIndex,
+            this.trickCards,
+            this.trickPlayers,
+            this.highCard,
+            this.highCardPlayerIndex,
+            this.players.map(p => p.score),
+            this.players.map(p => p.eliminated)
+        );
+    }
+
+    // Utility from the perspective of the deciding player. The score-factor
+    // ramps from 1× at score 0 to 6× at score 49 so points hurt much more as
+    // a player nears the 50-point elimination threshold. Eliminations dominate
+    // any single-round point swing.
+    evaluateSimOutcome(sim, myIndex, scoresBefore, eliminatedBefore) {
+        let utility = 0;
+
+        const myDelta = sim.scores[myIndex] - scoresBefore[myIndex];
+        const myJustEliminated = sim.eliminated[myIndex] && !eliminatedBefore[myIndex];
+        const myFactor = 1 + (scoresBefore[myIndex] / 50) * 5;
+        if (myJustEliminated) {
+            utility -= 1500;
         } else {
-            // Following in a trick
-            if (card === player.getLowestCard()) {
-                // Playing lowest card
-                score += this.evaluateLowestCardPlay(playerIndex, card, tricksLeft);
-            } else {
-                // Playing higher than current high
-                score += this.evaluateHighCardPlay(playerIndex, card, tricksLeft);
-            }
+            utility -= myDelta * myFactor;
         }
 
-        // Penalty for playing ace late in the game
-        if (card.value === 14 && tricksLeft <= 2) {
-            score -= 200;
+        let activeOpponents = 0;
+        for (let i = 0; i < this.players.length; i++) {
+            if (i !== myIndex && !eliminatedBefore[i]) activeOpponents++;
         }
-
-        // Consider opponent scores
-        score += this.considerOpponentScores(playerIndex, card);
-
-        return score;
-    }
-
-    evaluateLowestCardPlay(playerIndex, card, tricksLeft) {
-        let score = 0;
-        const player = this.players[playerIndex];
-        const hasAce = player.hand.some(c => c.value === 14);
-
-        // If we have an ace, we want to avoid being forced to play it
-        if (hasAce && tricksLeft <= 3) {
-            // Playing lowest is risky when we have ace
-            score -= 30;
-        } else {
-            // Generally safe to play lowest
-            score += 30;
-        }
-
-        // If our lowest is very low, it's usually safe
-        if (card.value <= 5) {
-            score += 20;
-        }
-
-        return score;
-    }
-
-    evaluateHighCardPlay(playerIndex, card, tricksLeft) {
-        let score = 0;
-        const player = this.players[playerIndex];
-
-        // Check how many higher cards are still out there
-        const higherCardsOut = this.countHigherCardsRemaining(card.value);
-
-        // If few higher cards remain, this is risky
-        if (higherCardsOut <= 2) {
-            score -= 40;
-
-            // Extra penalty for last few tricks
-            if (tricksLeft <= 2) {
-                score -= 60;
-            }
-        }
-
-        // If we can force someone with high cards
-        if (this.canForceOpponentWithHighCard(playerIndex, card)) {
-            score += 50;
-        }
-
-        // Prefer to take control early if we have dangerous cards
-        if (player.hand.some(c => c.value >= 12) && tricksLeft > 3) {
-            score += 20;
-        }
-
-        return score;
-    }
-
-    countHigherCardsRemaining(value) {
-        let count = 0;
-        for (let v = value + 1; v <= 14; v++) {
-            count += this.remainingCardsByValue[v] || 0;
-        }
-        return count;
-    }
-
-    canForceOpponentWithHighCard(playerIndex, card) {
-        // Check if playing this card might force an opponent with known high cards
-        const nextPlayerIndex = (playerIndex + 1) % this.players.length;
-        const nextPlayer = this.players[nextPlayerIndex];
-
-        if (nextPlayer.eliminated) return false;
-
-        // If we know their minimum card is high
-        const minCard = this.playerMinimumCard[nextPlayerIndex];
-        if (minCard && minCard >= 10) {
-            return true;
-        }
-
-        return false;
-    }
-
-    considerOpponentScores(playerIndex, card) {
-        let score = 0;
-
-        // Check opponents close to elimination
-        this.players.forEach((opponent, idx) => {
-            if (idx === playerIndex || opponent.eliminated) return;
-
-            // If opponent is close to 50 points
-            if (opponent.score >= 40) {
-                // Be more aggressive if we're not in danger
-                if (this.players[playerIndex].score < 30) {
-                    score += 10;
+        if (activeOpponents > 0) {
+            for (let i = 0; i < this.players.length; i++) {
+                if (i === myIndex || eliminatedBefore[i]) continue;
+                const oppDelta = sim.scores[i] - scoresBefore[i];
+                const oppJustEliminated = sim.eliminated[i] && !eliminatedBefore[i];
+                const oppFactor = 1 + (scoresBefore[i] / 50) * 5;
+                if (oppJustEliminated) {
+                    utility += 600 / activeOpponents;
+                } else {
+                    utility += oppDelta * oppFactor * 0.5 / activeOpponents;
                 }
             }
+        }
 
-            // If opponent has high score and might have ace
-            if (opponent.score >= 35 && !this.hasPlayedAce(idx)) {
-                // Try to force them to play high
-                score += 5;
-            }
-        });
-
-        return score;
-    }
-
-    hasPlayedAce(playerIndex) {
-        const pile = this.playerPiles[playerIndex] || [];
-        return pile.some(card => card.value === 14);
+        return utility;
     }
 
     playCard(playerIndex, card) {
@@ -880,20 +986,17 @@ class GurkaGame {
     }
 
     updateMinimumCardKnowledge(playerIndex, playedCard) {
-        const player = this.players[playerIndex];
-
-        // If player played their lowest card when they could have played higher
-        if (this.highCard && playedCard === player.getLowestCard()) {
-            // We now know their new minimum is at least the next card in their hand
-            if (player.hand.length > 0) {
-                this.playerMinimumCard[playerIndex] = player.hand[0].value;
+        // Called before this.highCard is updated for the current play, so it
+        // still holds the high card the player was responding to. If a player
+        // followed by playing a card that did not beat that high card, the
+        // rules force the card to have been their lowest — every remaining
+        // card in their hand must therefore be strictly higher.
+        if (this.highCard && playedCard.value <= this.highCard.value) {
+            const inferred = playedCard.value + 1;
+            const current = this.playerMinimumCard[playerIndex] || 2;
+            if (inferred > current) {
+                this.playerMinimumCard[playerIndex] = inferred;
             }
-        }
-
-        // If they played higher than the high card, we know their lowest is at most that value
-        if (this.highCard && playedCard.value > this.highCard.value) {
-            const currentMin = this.playerMinimumCard[playerIndex] || 2;
-            this.playerMinimumCard[playerIndex] = Math.max(currentMin, playedCard.value);
         }
     }
 
